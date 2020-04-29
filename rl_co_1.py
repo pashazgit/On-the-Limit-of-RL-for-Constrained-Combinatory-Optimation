@@ -1,7 +1,6 @@
 
 import sys
-# sys.path.insert(0, "./adaptive_quantization/input_pipeline")
-# sys.path.insert(0, "./adaptive_quantization/utils")
+# sys.path.insert(0, "./")
 import os
 import numpy as np
 import torch
@@ -51,6 +50,10 @@ parser.add_argument("--log_dir", type=str,
 parser.add_argument("--lr", type=float,
                     default=1e-4,
                     help="Learning rate (gradient step size)")
+
+parser.add_argument("--scale", type=float,
+                    default=2000,
+                    help="")
 
 parser.add_argument("--batch_size", type=int,
                     default=512,
@@ -192,17 +195,19 @@ def train(args):
             if torch.cuda.is_available():
                 adj, al = adj.cuda(), al.cuda()
             adj_c = 1 - adj
+            assert adj_c.is_cuda
+            assert al.is_cuda
             # Apply the model to obtain scores (forward pass)
             logits = model(al, adj_c, args.T)
             log_prob = F.log_softmax(logits, dim=-1).max(dim=-1)[0].sum(dim=-1, keepdim=True)
             # Compute the return
             t = logits.detach()  # remove the logits from propagation graph
-            al_n = F.one_hot(t.argmax(dim=-1), num_classes=args.hosts).to(torch.float32)
+            al_n = F.one_hot(t.argmax(dim=-1), num_classes=args.hosts).to(torch.float32).cuda()
             risk_n = torch.matmul(torch.matmul(al_n.transpose(dim0=1, dim1=2), adj_c), al_n)
             risk_n = risk_n.diagonal(dim1=1, dim2=2).sum(dim=-1, keepdim=True)
             risk = torch.matmul(torch.matmul(al.transpose(dim0=1, dim1=2), adj_c), al)
             risk = risk.diagonal(dim1=1, dim2=2).sum(dim=-1, keepdim=True)
-            ret = risk - risk_n
+            ret = (risk - risk_n) / args.scale
             # back-propagation
             reinforce = ret * log_prob
             loss = -reinforce.mean()
@@ -238,7 +243,7 @@ def train(args):
                         logits = model(al, adj_c, args.T)
                         # Compute return and store as numpy
                         t = logits
-                        al_n = F.one_hot(t.argmax(dim=-1), num_classes=args.hosts).to(torch.float32)
+                        al_n = F.one_hot(t.argmax(dim=-1), num_classes=args.hosts).to(torch.float32).cuda()
                         risk_n = torch.matmul(torch.matmul(al_n.transpose(dim0=1, dim1=2), adj_c), al_n)
                         risk_n = risk_n.diagonal(dim1=1, dim2=2).sum(dim=-1, keepdim=True)
                         risk = torch.matmul(torch.matmul(al.transpose(dim0=1, dim1=2), adj_c), al)

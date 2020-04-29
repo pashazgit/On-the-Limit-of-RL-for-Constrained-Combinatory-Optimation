@@ -80,6 +80,10 @@ parser.add_argument("--eps_decay", type=float,
                     default=200,
                     help="")
 
+parser.add_argument("--scale", type=float,
+                    default=2000,
+                    help="")
+
 parser.add_argument("--clip", type=str2bool,
                     default=True,
                     help="")
@@ -216,6 +220,7 @@ def train():
     replay_batch = args.replay_batch
     gamma = args.gamma
     val_batch = args.val_batch
+    scale = args.scale
 
     # Initialize training
     steps_done = 0
@@ -276,8 +281,9 @@ def train():
                 state, action = stack_xa.get(0)
                 assert state.is_cuda
                 acc_reward = 0
-                for _j in range(args.delay):
+                for _j in range(delay):
                     acc_reward += stack_reward.get(_j)
+                acc_reward /= scale
                 acc_reward = torch.tensor([acc_reward], device=device)
                 phone = torch.tensor([_i+1-delay], device=device)
                 memory.push(state, adj_c, phone, action, next_state, acc_reward)
@@ -360,7 +366,7 @@ def train():
         assert risk_final.requires_grad is False
         risk_final = risk_final.diagonal(dim1=1, dim2=2).sum(dim=-1)
 
-        ret = (risk_init - risk_final).mean().item()  # return per episode
+        ret = (risk_init - risk_final).mean().item() / scale  # return per episode
 
         #################################################################
 
