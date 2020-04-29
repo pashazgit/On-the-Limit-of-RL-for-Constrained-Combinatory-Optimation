@@ -1,24 +1,28 @@
 
 import sys
-# sys.path.insert(0, "./adaptive_quantization/input_pipeline")
-# sys.path.insert(0, "./adaptive_quantization/utils")
+# sys.path.insert(0, "./")
 import os
+import math
+import random
 import numpy as np
+from collections import namedtuple
+from itertools import count
+import matplotlib.pyplot as plt
+from PIL import Image
+from tqdm import tqdm
+import h5py
+import argparse
+import queue
+import pdb
+
 import torch
 from torch import nn, optim
-from tqdm import tqdm
 from tensorboardX import SummaryWriter
 import torchvision
-import argparse
-from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-import h5py
+from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
-from PIL import Image
-import matplotlib.pyplot as plt
 from torch.nn import init
-import math
-import pdb
 
 
 # ----------------------------------------
@@ -31,13 +35,17 @@ def str2bool(v):
 # Global variables within this script
 parser = argparse.ArgumentParser()
 
-parser.add_argument("--mode", type=str,
-                    default="train",
-                    choices=["train", "test"],
-                    help="Run mode")
+# parser.add_argument("--mode", type=str,
+#                     default="train",
+#                     choices=["train", "test"],
+#                     help="Run mode")
 
-parser.add_argument("--data_dir", type=str,
-                    default="/home/pasha/scratch/datasets/graphs",
+# parser.add_argument("--data_dir", type=str,
+#                     default="/home/pasha/scratch/datasets/graphs",
+#                     help="")
+
+parser.add_argument("--optim", type=str,
+                    default="Adam",
                     help="")
 
 parser.add_argument("--save_dir", type=str,
@@ -46,104 +54,147 @@ parser.add_argument("--save_dir", type=str,
 
 parser.add_argument("--log_dir", type=str,
                     default="/home/pasha/scratch/jobs/output/RL-CO/logs",
-                    help="Directory to save logs and current model")
+                    help="Directory to save logs")
+
+parser.add_argument("--rand_edge", type=float,
+                    default=0.387,
+                    help="")
 
 parser.add_argument("--lr", type=float,
                     default=1e-4,
                     help="Learning rate (gradient step size)")
 
-parser.add_argument("--init_stddev", type=float,
-                    default=1e-3,
-                    help="Learning rate (gradient step size)")
-
-parser.add_argument("--batch_size", type=int,
-                    default=128,
-                    help="Size of each training batch")
-
-parser.add_argument("--p", type=int,
-                    default=64,
+parser.add_argument("--gamma", type=float,
+                    default=0.999,
                     help="")
 
-parser.add_argument("--T", type=int,
-                    default=4,
+parser.add_argument("--eps_start", type=float,
+                    default=0.9,
                     help="")
 
-parser.add_argument("--phones", type=int,
+parser.add_argument("--eps_end", type=float,
+                    default=0.05,
+                    help="")
+
+parser.add_argument("--eps_decay", type=float,
                     default=200,
                     help="")
 
-parser.add_argument("--hosts", type=int,
+parser.add_argument("--clip", type=str2bool,
+                    default=True,
+                    help="")
+
+parser.add_argument("--clamp", type=str2bool,
+                    default=True,
+                    help="")
+
+parser.add_argument("--target_update", type=int,
+                    default=1,
+                    help="")
+
+# parser.add_argument("--init_stddev", type=float,
+#                     default=1e-3,
+#                     help="Learning rate (gradient step size)")
+
+parser.add_argument("--replay_batch", type=int,
+                    default=128,
+                    help="")
+
+parser.add_argument("--val_batch", type=int,
+                    default=16,
+                    help="")
+
+parser.add_argument("--n_episodes", type=int,
+                    default=50,
+                    help="")
+
+parser.add_argument("--embed_dim", type=int,
+                    default=64,
+                    help="")
+
+parser.add_argument("--n_heads", type=int,
+                    default=4,
+                    help="")
+
+parser.add_argument("--enc_ff_hidden", type=int,
+                    default=256,
+                    help="Encoder feed_forward hidden units")
+
+parser.add_argument("--dec_ff_hidden", type=int,
+                    default=256,
+                    help="Decoder feed_forward hidden units")
+
+parser.add_argument("--n_layers", type=int,
+                    default=2,
+                    help="")
+
+parser.add_argument("--n_phones", type=int,
+                    default=57,
+                    help="")
+
+parser.add_argument("--n_hosts", type=int,
                     default=5,
                     help="")
 
-parser.add_argument("--num_epoch", type=int,
-                    default=40,
-                    help="Number of epochs to train")
-
-parser.add_argument("--val_intv", type=int,
-                    default=500,
-                    help="Validation interval")
-
-parser.add_argument("--rep_intv", type=int,
-                    default=500,
-                    help="Report interval")
-
-# parser.add_argument("--l2_reg", type=float,
-#                     default=1e-4,
-#                     help="L2 Regularization strength")
-
-parser.add_argument("--resume", type=str2bool,
-                    default=True,
-                    help="Whether to resume training from existing checkpoint")
+parser.add_argument("--delay", type=int,
+                    default=8,
+                    help="")
 
 parser.add_argument("--name_idx", type=int,
                     default=0,
                     help="")
 
 
-def main():
+def train():
     args = parser.parse_args()
-    if args.mode == "train":
-        train(args)
-    elif args.mode == "test":
-        test(args)
-    else:
-        raise ValueError("Unknown run mode \"{}\"".format(args.mode))
 
+    random.seed(7)
+    torch.manual_seed(7)
 
-def train(args):
     # CUDA_LAUNCH_BLOCKING = 1
+    # if gpu is to be used
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Initialize datasets for both training and validation
-    tr_file_path = os.path.join(args.data_dir, 'tr.h5')
-    val_file_path = os.path.join(args.data_dir, 'val.h5')
-    tr_data = graphs(tr_file_path)
-    val_data = graphs(val_file_path)
+    policy_net = DQN(args).to(device)
+    target_net = DQN(args).to(device)
+    target_net.load_state_dict(policy_net.state_dict())
+    target_net.eval()
 
-    # Create data loader for training and validation.
-    tr_loader = DataLoader(
-        dataset=tr_data,
-        batch_size=args.batch_size,
-        num_workers=2,
-        shuffle=True)
-    val_loader = DataLoader(
-        dataset=val_data,
-        batch_size=100,
-        num_workers=2,
-        shuffle=False)
+    if args.optim == 'Adam':
+        optimizer = optim.Adam(policy_net.parameters(), lr=args.lr)
+    else:
+        optimizer = optim.RMSprop(policy_net.parameters(), lr=args.lr)
 
-    # Create model instance
-    model = model_class(tr_data.al_shp, args.p, args.init_stddev)
-    print('\nmodel created')
-    # Move model to gpu if cuda is available
-    if torch.cuda.is_available():
-        # model = torch.nn.DataParallel(model).cuda()
-        model = model.cuda()
-    model.train()
+    capacity = args.n_episodes * args.n_phones
+    memory = ReplayMemory(capacity)
 
-    # Create optimizier
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    # No need to move the optimizer (as of PyTorch 1.0), it lies in the same space as the model
+    Transition = namedtuple('Transition',
+                            ('state', 'adj_c', 'phone', 'action', 'next_state', 'acc_reward'))
+
+    stack_xa = StackXAction(maxsize=args.delay)
+    stack_reward = StackReward(maxsize=args.delay)
+
+    ################# random validation dataset #####################
+
+    # Path to valid data
+    # val_file_path = os.path.join(args.data_dir, 'val.h5')
+
+    val_adj = torch.rand(args.val_batch, args.n_phones, args.n_phones)
+    val_adj = (val_adj + val_adj.transpose(dim0=1, dim1=2)) / 2
+    val_adj = (val_adj < args.rand_edge).type(torch.float32)
+    for _j in range(args.n_phones):
+        val_adj[:, _j, _j] = 1
+    val_adj_c = (1 - val_adj)
+    # Generate random allocation matrix for val dataset
+    val_hot_idx = torch.randint(high=args.n_hosts, size=(args.val_batch * args.n_phones, ))  # host index
+    val_x = F.one_hot(val_hot_idx, num_classes=args.n_hosts).reshape(
+        16, args.n_phones, args.n_hosts).type(torch.float32)
+
+    risk_init = torch.matmul(torch.matmul(val_x.transpose(dim0=1, dim1=2).to(device),
+                                          val_adj_c.to(device)), val_x.to(device))
+    risk_init = risk_init.diagonal(dim1=1, dim2=2).sum(dim=-1)
+
+    #################################################################
 
     # Create log directory and save directory if it does not exist
     if not os.path.exists(args.log_dir):
@@ -152,178 +203,539 @@ def train(args):
         os.makedirs(args.save_dir)
 
     # Create summary writer
-    tr_writer = SummaryWriter(
-        log_dir=os.path.join(args.log_dir, "train_{}".format(args.name_idx)))
     val_writer = SummaryWriter(
         log_dir=os.path.join(args.log_dir, "valid_{}".format(args.name_idx)))
+    # Prepare checkpoint file
+    checkpoint_file = os.path.join(args.save_dir, "checkpoint_{}.path".format(args.name_idx))
+
+    n_phones = args.n_phones
+    eps_end = args.eps_end
+    eps_start = args.eps_start
+    eps_decay = args.eps_decay
+    delay = args.delay
+    replay_batch = args.replay_batch
+    gamma = args.gamma
+    val_batch = args.val_batch
 
     # Initialize training
-    start_epoch = 0
-    iter_idx = -1  # make counter start at zero
-    best_val_ret = 0  # to check if best validation accuracy
-    # Prepare checkpoint file and model file to save and load from
-    checkpoint_file = os.path.join(args.save_dir, "checkpoint_{}.path".format(args.name_idx))
-    bestmodel_file = os.path.join(args.save_dir, "bestmodel_{}.path".format(args.name_idx))
-
-    # Check for existing training results. If it exists, and the configuration
-    # is set to resume `args.resume==True`, resume from previous training. If
-    # not, delete existing checkpoint.
-    if os.path.exists(checkpoint_file):
-        if args.resume:
-            print("Checkpoint found! Resuming")
-            # Read checkpoint file.
-            load_res = torch.load(
-                checkpoint_file,
-                map_location="cpu")
-            start_epoch = load_res["epoch"]
-            # Resume iterations
-            iter_idx = load_res["iter_idx"]
-            # Resume best va result
-            best_val_ret = load_res["best_val_ret"]
-            # Resume model
-            model.load_state_dict(load_res["model"])
-            # Resume optimizer
-            optimizer.load_state_dict(load_res["optimizer"])
-        else:
-            os.remove(checkpoint_file)
+    steps_done = 0
 
     # Training loop
-    for epoch in tqdm(range(start_epoch, args.num_epoch)):
+    for episode in tqdm(range(args.n_episodes)):
+        # Generate random graph
+        adj = torch.rand(1, args.n_phones, args.n_phones)
+        adj = (adj + adj.transpose(dim0=1, dim1=2)) / 2
+        adj = (adj < args.rand_edge).type(torch.float32)
+        for _j in range(args.n_phones):
+            adj[:, _j, _j] = 1
+        adj_c = (1 - adj).to(device)
+        # Generate random allocation matrix
+        hot_idx = torch.randint(high=args.n_hosts, size=(1 * args.n_phones, ))  # host index
+        x = F.one_hot(hot_idx, num_classes=args.n_hosts).reshape(
+            1, args.n_phones, args.n_hosts).type(torch.float32).to(device)
 
-        for adj, al in tr_loader:
-            iter_idx += 1  # Counter
-            # Send data to GPU if we have one
-            if torch.cuda.is_available():
-                adj, al = adj.cuda(), al.cuda()
-            adj_c = 1 - adj
-            # Apply the model to obtain scores (forward pass)
-            logits = model(al, adj_c, args.T)
-            log_prob = F.log_softmax(logits, dim=-1).max(dim=-1)[0].sum(dim=-1, keepdim=True)
-            # Compute the return
-            t = logits.detach()  # remove the logits from propagation graph
-            al_n = F.one_hot(t.argmax(dim=-1), num_classes=args.hosts).to(torch.float32)
-            risk_n = torch.matmul(torch.matmul(al_n.transpose(dim0=1, dim1=2), adj_c), al_n)
-            risk_n = risk_n.diagonal(dim1=1, dim2=2).sum(dim=-1, keepdim=True)
-            risk = torch.matmul(torch.matmul(al.transpose(dim0=1, dim1=2), adj_c), al)
-            risk = risk.diagonal(dim1=1, dim2=2).sum(dim=-1, keepdim=True)
-            ret = risk - risk_n
-            # back-propagation
-            reinforce = ret * log_prob
-            loss = -reinforce.mean()
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        risk_bf = torch.matmul(torch.matmul(x.transpose(dim0=1, dim1=2), adj_c), x)
+        risk_bf = risk_bf.diagonal(dim1=1, dim2=2).sum(dim=-1)
 
-            # Monitor results every report interval
-            if iter_idx % args.rep_intv == 0:
-                tr_writer.add_scalar("data/return", ret.mean(), global_step=iter_idx)
-                # Save
-                torch.save({
-                    "epoch": epoch,
-                    "iter_idx": iter_idx,
-                    "best_val_ret": best_val_ret,
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                }, checkpoint_file)
+        for _i in range(n_phones):
+            # select action
+            sample = random.random()
+            eps_threshold = eps_end + (eps_start - eps_end) * \
+                            math.exp(-1. * steps_done / eps_decay)
+            steps_done += 1
+            if sample > eps_threshold:
+                with torch.no_grad():
+                    # t.max(1) will return largest column value of each row.
+                    # second column on max result is index of where max element was
+                    # found, so we pick action with the larger expected reward.
+                    phone = torch.tensor([_i], device=device)
+                    action = policy_net(x, adj_c, phone).max(1)[1].view(1, 1)
+            else:
+                action = \
+                    torch.tensor([[random.randrange(args.n_hosts)]], device=device, dtype=torch.long)
+            assert action.is_cuda
+            stack_xa.put((x, action))
 
-            # Validate results every validation interval
-            if iter_idx % args.val_intv == 0:
-                # Set model for evaluation
-                model.eval()
+            # Compute the reward
+            x_i = F.one_hot(action, num_classes=args.n_hosts).type(torch.float32).to(device)
+            x[:, _i, :] = x_i.squeeze(dim=1)
+            risk_af = torch.matmul(torch.matmul(x.transpose(dim0=1, dim1=2), adj_c), x)
+            risk_af = risk_af.diagonal(dim1=1, dim2=2).sum(dim=-1)
+            reward = (risk_bf - risk_af).item()
+            assert risk_af.is_cuda
+            assert risk_af.requires_grad is False
+            stack_reward.put(reward)
 
-                val_ret = []  # List to contain all returns for all the val batches
-                for adj, al in val_loader:
-                    # Send data to GPU if we have one
-                    if torch.cuda.is_available():
-                        adj, al = adj.cuda(), al.cuda()
-                    adj_c = 1 - adj
-                    # Apply forward pass to compute the returns for each of the val batches
-                    with torch.no_grad():
-                        logits = model(al, adj_c, args.T)
-                        # Compute return and store as numpy
-                        t = logits
-                        al_n = F.one_hot(t.argmax(dim=-1), num_classes=args.hosts).to(torch.float32)
-                        risk_n = torch.matmul(torch.matmul(al_n.transpose(dim0=1, dim1=2), adj_c), al_n)
-                        risk_n = risk_n.diagonal(dim1=1, dim2=2).sum(dim=-1, keepdim=True)
-                        risk = torch.matmul(torch.matmul(al.transpose(dim0=1, dim1=2), adj_c), al)
-                        risk = risk.diagonal(dim1=1, dim2=2).sum(dim=-1, keepdim=True)
-                        ret = risk - risk_n
-                        val_ret += [ret.cpu().numpy()]
-                val_ret_avg = np.mean(val_ret)
-                # Write return to tensorboard, using keywords `return`.
-                val_writer.add_scalar("data/return", val_ret_avg, global_step=iter_idx)
+            if _i+1 < n_phones:
+                next_state = x
+                risk_bf = risk_af
+            else:
+                next_state = None
 
-                # Set model back for training
-                model.train()
+            if _i+1 >= delay:
+                state, action = stack_xa.get(0)
+                assert state.is_cuda
+                acc_reward = 0
+                for _j in range(args.delay):
+                    acc_reward += stack_reward.get(_j)
+                acc_reward = torch.tensor([acc_reward], device=device)
+                phone = torch.tensor([_i+1-delay], device=device)
+                memory.push(state, adj_c, phone, action, next_state, acc_reward)
 
-                if val_ret_avg > best_val_ret:
-                    best_val_ret = val_ret_avg
-                    # Save
-                    torch.save({
-                        "model": model.state_dict(),
-                    }, bestmodel_file)
+            # Optimize model
+            if len(memory) >= replay_batch:
+                transitions = memory.sample(replay_batch)
+                # Transpose the batch (see https://stackoverflow.com/a/19343/3343043 for
+                # detailed explanation). This converts batch-array of Transitions
+                # to Transition of batch-arrays.
+                batch = Transition(*zip(*transitions))
+
+                # Compute a mask of non-final states and concatenate the batch elements
+                # (a final state would've been the one after which simulation ended)
+                non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
+                                                        batch.next_state)), device=device, dtype=torch.bool)
+                non_final_next_states = torch.cat([s for s in batch.next_state
+                                                   if s is not None])
+                non_final_next_adj_c = torch.cat([s for _j, s in enumerate(batch.adj_c)
+                                                  if non_final_mask[_j].item() is True])
+                non_final_next_phone = torch.cat([s for _j, s in enumerate(batch.phone)
+                                                  if non_final_mask[_j].item() is True]) + delay
+                assert len(non_final_next_states) == len(non_final_next_adj_c)
+                assert non_final_next_adj_c.is_cuda
+                state_batch = torch.cat(batch.state)
+                adj_c_batch = torch.cat(batch.adj_c)
+                phone_batch = torch.cat(batch.phone)  # (replay_batch, )
+                action_batch = torch.cat(batch.action)
+                acc_reward_batch = torch.cat(batch.acc_reward)  # (replay_batch, )
+                assert adj_c_batch.is_cuda
+
+                # Compute Q(s_t, a) - the model computes Q(s_t), then we select the
+                # columns of actions taken. These are the actions which would've been taken
+                # for each batch state according to policy_net
+                state_action_values = policy_net(state_batch, adj_c_batch, phone_batch).gather(1, action_batch)
+                # Compute V(s_{t+1}) for all next states.
+                # Expected values of actions for non_final_next_states are computed based
+                # on the "older" target_net; selecting their best reward with max(1)[0].
+                # This is merged based on the mask, such that we'll have either the expected
+                # state value or 0 in case the state was final.
+                next_state_values = torch.zeros(replay_batch, device=device)
+                next_state_values[non_final_mask] = target_net(non_final_next_states,
+                                                               non_final_next_adj_c ,
+                                                               non_final_next_phone).max(1)[0].detach()
+
+                # Compute the expected Q values
+                assert next_state_values.shape == acc_reward_batch.shape
+                expected_state_action_values = (next_state_values * gamma) + acc_reward_batch
+
+                # Compute Huber loss
+                loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
+
+                # Optimize the model
+                optimizer.zero_grad()
+                loss.backward()
+                if args.clamp:
+                    for param in policy_net.parameters():
+                        param.grad.data.clamp_(-1, 1)
+                optimizer.step()
+
+        ##################### validation result #########################
+
+        adj_c = val_adj_c.to(device)
+        x = val_x.to(device)
+
+        for _i in range(n_phones):
+            with torch.no_grad():
+                phone_set = torch.ones(val_batch).type(torch.int).to(device) * _i
+
+                # select action
+                action = policy_net(x, adj_c, phone_set).max(1)[1]
+
+                # Compute the reward
+                x_i = F.one_hot(action, num_classes=args.n_hosts).type(torch.float32).to(device)
+                x[:, _i, :] = x_i
+                assert x.is_cuda
+
+        risk_final = torch.matmul(torch.matmul(x.transpose(dim0=1, dim1=2), adj_c), x)
+        assert risk_final.diagonal(dim1=1, dim2=2).size() == (args.val_batch, args.n_hosts)
+        assert risk_final.requires_grad is False
+        risk_final = risk_final.diagonal(dim1=1, dim2=2).sum(dim=-1)
+
+        ret = (risk_init - risk_final).mean().item()  # return per episode
+
+        #################################################################
+
+        # Monitor validation results every episode
+        val_writer.add_scalar("data/return", ret, global_step=episode)
+
+        # Update the target network, copying all weights and biases in DQN
+        if episode % args.target_update == 0:
+            target_net.load_state_dict(policy_net.state_dict())
+
+    torch.save({"model": policy_net.state_dict()}, checkpoint_file)
 
 
-def test(args):
-    pass
+class ReplayMemory(object):
 
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.memory = []
+        self.position = 0
+        self.Transition = namedtuple('Transition',
+                                     ('state', 'adj_c', 'phone', 'action', 'next_state', 'acc_reward'))
 
-class graphs(Dataset):
-    def __init__(self, hdf5_file_path):
-        self.hdf5_file = h5py.File(hdf5_file_path, mode='r')
-        self.transform = transforms.ToTensor()
-        self.adj_shp = self.hdf5_file["adj"][0].shape
-        self.al_shp = self.hdf5_file["al"][0].shape
+    def push(self, *args):
+        """Saves a transition."""
+        if len(self.memory) < self.capacity:
+            self.memory.append(None)
+        else:
+            raise ValueError("number of iterations exceeds {}".format(self.capacity))
+        self.memory[self.position] = self.Transition(*args)
+        self.position = (self.position + 1) % self.capacity
+
+    def sample(self, replay_batch):
+        return random.sample(self.memory, replay_batch)
 
     def __len__(self):
-        return len(self.hdf5_file["adj"])
-
-    def __getitem__(self, idx):
-        adj = self.hdf5_file["adj"][idx]
-        al = self.hdf5_file["al"][idx]
-        adj = self.transform(adj).squeeze()
-        al = self.transform(al).squeeze()
-        return adj, al
+        return len(self.memory)
 
 
-class model_class(nn.Module):
-    def __init__(self, al_shape, p, stddev):
-        super(model_class, self).__init__()
-        phones, hosts = al_shape
+class StackReward(object):
 
-        self.theta1 = nn.Parameter(torch.randn(hosts, p)*stddev, requires_grad=True)
-        self.ws_pre1 = nn.Parameter(torch.randn(p, p)*stddev, requires_grad=True)
-        self.bs_pre1 = nn.Parameter(torch.zeros(p), requires_grad=True)
-        self.ws_pre2 = nn.Parameter(torch.randn(p, p)*stddev, requires_grad=True)
-        self.bs_pre2 = nn.Parameter(torch.zeros(p), requires_grad=True)
-        self.theta2 = nn.Parameter(torch.randn(p, p)*stddev, requires_grad=True)
-        self.ws_post1 = nn.Parameter(torch.randn(p, p)*stddev, requires_grad=True)
-        self.bs_post1 = nn.Parameter(torch.zeros(p), requires_grad=True)
+    def __init__(self, maxsize):
+        self.maxsize = maxsize
+        self.memory = []
 
-        self.ws_output = nn.Parameter(torch.randn(p, hosts)*stddev, requires_grad=True)
-        self.bs_output = nn.Parameter(torch.zeros(hosts), requires_grad=True)
+    def put(self, reward):
+        """Saves a reward."""
+        if len(self.memory) < self.maxsize:
+            self.memory.append(reward)
+        else:
+            del self.memory[0]
+            self.memory.append(reward)
 
-    def forward(self, al, adj_c, T):
-        mu = F.relu(torch.einsum('ijh,hk->ijk', al, self.theta1))
-        for t in range(T-1):
-            mu = F.relu(torch.einsum('kl,ivk->ivl', self.ws_pre1, mu) + self.bs_pre1)
-            mu = F.relu(torch.einsum('kl,ivk->ivl', self.ws_pre2, mu) + self.bs_pre2)
-            mu = torch.einsum('kl,ivk->ivl', self.theta2, torch.einsum('ivu,iuk->ivk', adj_c, mu))
-            mu = F.relu(torch.einsum('kl,ivk->ivl', self.ws_post1, mu) + self.bs_post1)
-            # mu = F.relu(torch.einsum('ijh,hk->ijk', al, self.theta1) + mu)
+    def get(self, index):
+        return self.memory[index]
 
-        mu = torch.einsum('kh,ivk->ivh', self.ws_output, mu) + self.bs_output
-
-        return mu
+    def __len__(self):
+        return len(self.memory)
 
 
-# def model_loss(args, model):
-#     loss = 0
-#     for name, param in model.named_parameters():
-#         if "weight" in name:
-#             loss += torch.sum(param**2)
-#     return loss * args.l2_reg
+class StackXAction(object):
+
+    def __init__(self, maxsize):
+        self.maxsize = maxsize
+        self.memory = []
+
+    def put(self, state):
+        """Saves a reward."""
+        if len(self.memory) < self.maxsize:
+            self.memory.append(state)
+        else:
+            del self.memory[0]
+            self.memory.append(state)
+
+    def get(self, index):
+        return self.memory[index]
+
+    def __len__(self):
+        return len(self.memory)
+
+
+class SkipConnection(nn.Module):
+
+    def __init__(self, module):
+        super(SkipConnection, self).__init__()
+        self.module = module
+
+    def forward(self, input):
+        return input + self.module(input)
+
+
+class Normalization(nn.Module):
+
+    def __init__(self, embed_dim):
+        super(Normalization, self).__init__()
+
+        self.normalizer = nn.BatchNorm1d(embed_dim, affine=True)
+
+        # Normalization by default initializes affine parameters with bias 0 and weight unif(0,1) which is too large!
+        # self.init_parameters()
+
+    # def init_parameters(self):
+    #
+    #     for name, param in self.named_parameters():
+    #         stdv = 1. / math.sqrt(param.size(-1))
+    #         param.data.uniform_(-stdv, stdv)
+
+    def forward(self, input):
+        return self.normalizer(input.view(-1, input.size(-1))).view(*input.size())
+
+
+class BasicBlock(nn.Sequential):
+    def __init__(self, args):
+        super(BasicBlock, self).__init__(
+            Normalization(args.embed_dim),
+            SkipConnection(
+                nn.Sequential(
+                    nn.Linear(args.embed_dim, args.enc_ff_hidden),
+                    nn.ReLU(),
+                    nn.Linear(args.enc_ff_hidden, args.embed_dim)
+                ) if args.enc_ff_hidden > 0 else nn.Linear(args.embed_dim, args.embed_dim)
+            ),
+            Normalization(args.embed_dim)
+        )
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, args, key_dim=None):
+        super(MultiHeadAttention, self).__init__()
+
+        val_dim = args.embed_dim // args.n_heads
+        if key_dim is None:
+            key_dim = val_dim
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.n_heads = args.n_heads
+        self.val_dim = val_dim
+
+        self.norm_factor = 1 / math.sqrt(key_dim)
+
+        self.W_query = nn.Parameter(torch.Tensor(args.n_heads, args.embed_dim, key_dim))
+        self.W_key = nn.Parameter(torch.Tensor(args.n_heads, args.embed_dim, key_dim))
+        self.W_val = nn.Parameter(torch.Tensor(args.n_heads, args.embed_dim, val_dim))
+
+        self.W_out = nn.Parameter(torch.Tensor(args.n_heads, val_dim, args.embed_dim))
+
+        self.init_parameters()
+
+    def init_parameters(self):
+
+        for param in self.parameters():
+            stdv = 1. / math.sqrt(param.size(-1))
+            param.data.uniform_(-stdv, stdv)
+
+    def forward(self, h, adj_c):
+        """
+        :param h: data (batch, graph_size, embed_dim)
+        """
+
+        # h should be (1, graph_size, embed_dim)
+        batch, graph_size, embed_dim = h.size()
+
+        hflat = h.contiguous().view(-1, embed_dim)
+
+        # last dimension can be different for keys and values
+        shp = (self.n_heads, batch, graph_size, -1)
+
+        Q = torch.matmul(hflat, self.W_query).view(shp)  # (n_heads, 1, graph_size, key_dim)
+        K = torch.matmul(hflat, self.W_key).view(shp)  # (n_heads, 1, graph_size, key_dim)
+        V = torch.matmul(hflat, self.W_val).view(shp)  # (n_heads, 1, graph_size, val_dim)
+
+        # Calculate compatibility (n_heads, 1, graph_size, graph_size)
+        compatibility = self.norm_factor * torch.matmul(Q, K.transpose(2, 3))
+
+        adj_c = adj_c.unsqueeze(dim=0).expand(self.n_heads, *adj_c.size())
+        assert compatibility.size() == adj_c.size()
+        compatibility = \
+            torch.where(adj_c == 0, -torch.tensor([float("inf")], device=self.device), compatibility)
+        attn = torch.softmax(compatibility, dim=-1)
+        attn = attn * adj_c
+
+        heads = torch.matmul(attn, V)
+
+        out = torch.mm(
+            heads.permute(1, 2, 0, 3).contiguous().view(-1, self.n_heads * self.val_dim),
+            self.W_out.view(-1, embed_dim)
+        ).view(batch, graph_size, embed_dim)
+
+        return out + h
+
+
+class GraphAttentionEncoder(nn.Module):
+    def __init__(self, args):
+        super(GraphAttentionEncoder, self).__init__()
+
+        self.n_layers = args.n_layers
+        self.init_embed = nn.Linear(args.n_hosts, args.embed_dim)
+
+        assert args.embed_dim % args.n_heads == 0
+        for _l in range(args.n_layers):
+            setattr(self, "mhasc_{}".format(_l), MultiHeadAttention(args))
+            setattr(self, "bb_{}".format(_l), BasicBlock(args))
+
+    def forward(self, x, adj_c):
+        """
+        :param x: (batch, graph_size, node_dim) input node features
+        """
+        h = self.init_embed(x)
+        for _l in range(self.n_layers):
+            h = getattr(self, "mhasc_{}".format(_l))(h, adj_c)
+            h = getattr(self, "bb_{}".format(_l))(h)
+
+        return h
+
+
+class MultiHeadAggregation(nn.Module):
+    def __init__(self, args, key_dim=None):
+        super(MultiHeadAggregation, self).__init__()
+
+        val_dim = args.embed_dim // args.n_heads
+        if key_dim is None:
+            key_dim = val_dim
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.clip = args.clip
+
+        self.n_heads = args.n_heads
+        self.val_dim = val_dim
+
+        self.norm_factor = 1 / math.sqrt(key_dim)
+
+        self.W_query_bf = nn.Parameter(torch.Tensor(args.embed_dim, key_dim))
+        self.W_key_bf = nn.Parameter(torch.Tensor(args.embed_dim, key_dim))
+        self.W_val_bf = nn.Parameter(torch.Tensor(args.embed_dim, val_dim))
+        self.W_out_bf = nn.Parameter(torch.Tensor(val_dim, args.embed_dim))
+
+        self.W_query_af = nn.Parameter(torch.Tensor(args.embed_dim, key_dim))
+        self.W_key_af = nn.Parameter(torch.Tensor(args.embed_dim, key_dim))
+        self.W_val_af = nn.Parameter(torch.Tensor(args.embed_dim, val_dim))
+        self.W_out_af = nn.Parameter(torch.Tensor(val_dim, args.embed_dim))
+
+        self.init_parameters()
+
+    def init_parameters(self):
+
+        for param in self.parameters():
+            stdv = 1. / math.sqrt(param.size(-1))
+            param.data.uniform_(-stdv, stdv)
+
+    def forward(self, h, adj_c, phone_set):
+        """
+        :param h: (batch, graph_size, embed_dim) embedding vector at hand
+        :param phone_set: the set of phone indexes
+        """
+        g_bf_list = []
+        g_af_list = []
+
+        for _i, phone in enumerate(phone_set):
+            phone = phone.item()
+            batch, graph_size, embed_dim = h.size()
+
+            h_i = h[_i, :, :].unsqueeze(dim=0)  # (1, graph_size, embed_dim)
+            hiflat = h_i.contiguous().view(-1, embed_dim)  # (graph_size, embed_dim)
+            h_ii = h_i[:, phone, :].unsqueeze(dim=1)  # (1, 1, embed_dim)
+            hiiflat = h_ii.contiguous().view(-1, embed_dim)  # (1, embed_dim)
+            assert hiiflat.is_cuda
+
+            # last dimension can be different for keys and values
+            shpi = (graph_size, -1)
+            # last dimension is key_size
+            shpii = (1, -1)
+
+            ################## non-adjacent phones before ###############
+
+            Q_bf = torch.mm(hiiflat, self.W_query_bf).view(shpii)  # queries (1, key_dim)
+            K_bf = torch.mm(hiflat, self.W_key_bf).view(shpi)  # keys (graph_size, key_dim)
+            V_bf = torch.mm(hiflat, self.W_val_bf).view(shpi)  # values (graph_size, val_dim)
+
+            # Calculate compatibility before (1, phone)
+            if self.clip:
+                compatibility_bf = \
+                    10 * torch.tanh(self.norm_factor * torch.mm(Q_bf, K_bf.T)[:, 0:phone])
+            else:
+                compatibility_bf = self.norm_factor * torch.mm(Q_bf, K_bf.T)[:, 0:phone]
+            adj_c_bf = adj_c[_i, phone, 0:phone].unsqueeze(dim=0)
+            assert compatibility_bf.size() == adj_c_bf.size()
+
+            if adj_c_bf.sum().item() > 0:
+                compatibility_bf = \
+                    torch.where(adj_c_bf == 0, -torch.tensor([float("inf")], device=self.device), compatibility_bf)
+                attn_bf = torch.softmax(compatibility_bf, dim=-1)
+                attn_bf = attn_bf * adj_c_bf
+
+                head_bf = torch.mm(attn_bf, V_bf[0:phone, :])  # (1, val_dim)
+
+                g_bf = torch.mm(head_bf, self.W_out_bf)  # (1, embed_dim)
+            else:
+                g_bf = torch.zeros(1, embed_dim).to(self.device)
+
+            g_bf_list.append(g_bf)
+
+            ################## non-adjacent phones after ###############
+
+            Q_af = torch.mm(hiiflat, self.W_query_af).view(shpii)  # queries (1, key_dim)
+            K_af = torch.mm(hiflat, self.W_key_af).view(shpi)  # keys (graph_size, key_dim)
+            V_af = torch.mm(hiflat, self.W_val_af).view(shpi)  # values (1, graph_size, val_dim)
+
+            # Calculate compatibility before (1, graph_size-phone)
+            if self.clip:
+                compatibility_af = \
+                    10 * torch.tanh(self.norm_factor * torch.matmul(Q_af, K_af.T)[:, phone:graph_size])
+            else:
+                compatibility_af = self.norm_factor * torch.matmul(Q_af, K_af.T)[:, phone:graph_size]
+            adj_c_af = adj_c[_i, phone, phone:graph_size].unsqueeze(dim=0)
+            assert compatibility_af.size() == adj_c_af.size()
+
+            if adj_c_af.sum().item() > 0:
+                compatibility_af = \
+                    torch.where(adj_c_af == 0, -torch.tensor([float("inf")], device=self.device), compatibility_af)
+                attn_af = torch.softmax(compatibility_af, dim=-1)
+                attn_af = attn_af * adj_c_af
+
+                head_af = torch.matmul(attn_af, V_af[phone:graph_size, :])  # (1, val_dim)
+
+                g_af = torch.mm(head_af, self.W_out_af)  # (1, embed_dim)
+            else:
+                g_af = torch.zeros(1, embed_dim).to(self.device)
+
+            g_af_list.append(g_af)
+
+        return torch.cat(g_bf_list, dim=0), torch.cat(g_af_list, dim=0)
+
+
+class Decoder(nn.Module):
+    def __init__(self, args):
+        super(Decoder, self).__init__()
+
+        assert args.embed_dim % args.n_heads == 0
+        self.mhg = MultiHeadAggregation(args)
+
+        self.action = nn.Sequential(
+            nn.Linear(2 * args.embed_dim, args.dec_ff_hidden),
+            nn.ReLU(),
+            nn.Linear(args.dec_ff_hidden, args.n_hosts))
+
+    def forward(self, h, adj_c, phone_set):
+        """
+        :param h: (1, graph_size, embed_dim) embedding vector at hand
+        :param phone_set: the set of phone indexes
+        """
+        g_bf, g_af = self.mhg(h, adj_c, phone_set)
+        assert g_bf.is_cuda
+        a = self.action(torch.cat((g_bf, g_af), dim=-1))  # action_values
+
+        return a
+    
+    
+class DQN(nn.Module):
+    def __init__(self, args):
+        super(DQN, self).__init__()
+        
+        self.encoder = GraphAttentionEncoder(args)
+        self.decoder = Decoder(args)
+
+    def forward(self, x, adj_c, phone_set):
+        """
+        :param x: (1, graph_size, node_dim) input node features
+        :param phone_set: the set of phone indexes
+        """
+        h = self.encoder(x, adj_c)
+        a = self.decoder(h, adj_c, phone_set)
+
+        return a
 
 
 if __name__ == "__main__":
-    main()
+    train()
