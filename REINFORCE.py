@@ -55,8 +55,12 @@ parser.add_argument("--scale", type=float,
                     default=2000,
                     help="")
 
+parser.add_argument("--init_stddev", type=float,
+                    default=1e-3,
+                    help="Learning rate (gradient step size)")
+
 parser.add_argument("--batch_size", type=int,
-                    default=512,
+                    default=128,
                     help="Size of each training batch")
 
 parser.add_argument("--p", type=int,
@@ -132,7 +136,7 @@ def train(args):
         shuffle=False)
 
     # Create model instance
-    model = model_class(tr_data.al_shp, args.p)
+    model = model_class(tr_data.al_shp, args.p, args.init_stddev)
     print('\nmodel created')
     # Move model to gpu if cuda is available
     if torch.cuda.is_available():
@@ -248,7 +252,7 @@ def train(args):
                         risk_n = risk_n.diagonal(dim1=1, dim2=2).sum(dim=-1, keepdim=True)
                         risk = torch.matmul(torch.matmul(al.transpose(dim0=1, dim1=2), adj_c), al)
                         risk = risk.diagonal(dim1=1, dim2=2).sum(dim=-1, keepdim=True)
-                        ret = risk - risk_n
+                        ret = (risk - risk_n) / args.scale
                         val_ret += [ret.cpu().numpy()]
                 val_ret_avg = np.mean(val_ret)
                 # Write return to tensorboard, using keywords `return`.
@@ -288,32 +292,34 @@ class graphs(Dataset):
 
 
 class model_class(nn.Module):
-    def __init__(self, al_shape, p):
+    def __init__(self, al_shape, p, stddev):
         super(model_class, self).__init__()
-        self.phones, self.hosts = al_shape
-        self.p = p
+        phones, hosts = al_shape
 
-        self.theta1 = nn.Linear(self.hosts, p, bias=False)
-        self.pre_linear1 = nn.Linear(p, p)
-        self.pre_linear2 = nn.Linear(p, p)
-        self.theta2 = nn.Linear(p, p, bias=False)
-        self.post_linear1 = nn.Linear(p, p)
+        self.theta1 = nn.Parameter(torch.randn(hosts, p)*stddev, requires_grad=True)
+        self.ws_pre1 = nn.Parameter(torch.randn(p, p)*stddev, requires_grad=True)
+        self.bs_pre1 = nn.Parameter(torch.zeros(p), requires_grad=True)
+        self.ws_pre2 = nn.Parameter(torch.randn(p, p)*stddev, requires_grad=True)
+        self.bs_pre2 = nn.Parameter(torch.zeros(p), requires_grad=True)
+        self.theta2 = nn.Parameter(torch.randn(p, p)*stddev, requires_grad=True)
+        self.ws_post1 = nn.Parameter(torch.randn(p, p)*stddev, requires_grad=True)
+        self.bs_post1 = nn.Parameter(torch.zeros(p), requires_grad=True)
 
-        self.output = nn.Linear(p, self.hosts)
+        self.ws_output = nn.Parameter(torch.randn(p, hosts)*stddev, requires_grad=True)
+        self.bs_output = nn.Parameter(torch.zeros(hosts), requires_grad=True)
 
     def forward(self, al, adj_c, T):
-        mu = F.relu(self.theta1(al.reshape(-1, self.hosts)))
+        mu = F.relu(torch.einsum('ijh,hk->ijk', al, self.theta1))
         for t in range(T-1):
-            mu = F.relu(self.pre_linear1(mu))
-            mu = F.relu(self.pre_linear2(mu))
-            mu = torch.matmul(adj_c, mu.reshape(-1, self.phones, self.p))
-            mu = self.theta2(mu.reshape(-1, self.p))
-            mu = F.relu(self.post_linear1(mu))
-            # mu = F.relu(self.theta1(al.reshape(-1, self.hosts)) + mu)
+            mu = F.relu(torch.einsum('kl,ivk->ivl', self.ws_pre1, mu) + self.bs_pre1)
+            mu = F.relu(torch.einsum('kl,ivk->ivl', self.ws_pre2, mu) + self.bs_pre2)
+            mu = torch.einsum('kl,ivk->ivl', self.theta2, torch.einsum('ivu,iuk->ivk', adj_c, mu))
+            mu = F.relu(torch.einsum('kl,ivk->ivl', self.ws_post1, mu) + self.bs_post1)
+            # mu = F.relu(torch.einsum('ijh,hk->ijk', al, self.theta1) + mu)
 
-        mu = self.output(mu)
+        mu = torch.einsum('kh,ivk->ivh', self.ws_output, mu) + self.bs_output
 
-        return mu.reshape(-1, self.phones, self.hosts)
+        return mu
 
 
 # def model_loss(args, model):
